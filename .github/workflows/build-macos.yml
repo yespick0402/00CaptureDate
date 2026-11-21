@@ -1,0 +1,35 @@
+name: Build 00CaptureDate macOS
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: macOS universal / self-contained
+    runs-on: macos-15
+    timeout-minutes: 40
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Test date logic and patterns
+        run: bash scripts/test-core.sh
+
+      - name: Build universal macOS app with verified ExifTool
+        run: bash scripts/build-macos.sh
+
+      - name: Upload app and checksum
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: 00CaptureDate-macOS-universal
+          path: |
+            dist/00CaptureDate-macOS-universal.zip
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
