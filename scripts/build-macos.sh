@@ -9,6 +9,8 @@ echo "=== Metadata capability guards ==="
 grep -q '"hif"' Sources/MetadataReader.swift || { echo 'HIF 지원 목록 누락'; exit 1; }
 grep -q '"arw"' Sources/MetadataReader.swift || { echo 'ARW 지원 목록 누락'; exit 1; }
 grep -q 'QuickTimeUTC=0' Sources/MetadataReader.swift || { echo '영상 시간대 정책 누락'; exit 1; }
+grep -q 'MetadataReader.exifArguments' Sources/PersistentExifSession.swift || { echo '공통 메타데이터 태그 정책 누락'; exit 1; }
+grep -q 'CREATE TABLE IF NOT EXISTS pairs' Sources/HistoryStore.swift || { echo '복원 동반 파일 기록 누락'; exit 1; }
 
 echo "=== Pinned ExifTool 13.64, SHA-256 validated ==="
 EXIF_VERSION="13.64"
@@ -33,7 +35,7 @@ for ARCH in arm64 x86_64; do
     echo "Compiling $ARCH for macOS 13+"
     xcrun swiftc -swift-version 5 -parse-as-library -O \
         -target "${ARCH}-apple-macos13.0" -sdk "$SDK" \
-        Sources/*.swift -framework SwiftUI -framework AppKit -framework CryptoKit \
+        Sources/*.swift -framework SwiftUI -framework AppKit -framework CryptoKit -lsqlite3 \
         -o "build/arch/00CaptureDate-${ARCH}"
 done
 lipo -create "build/arch/00CaptureDate-arm64" "build/arch/00CaptureDate-x86_64" \
@@ -55,8 +57,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>CFBundleName</key><string>00CaptureDate</string>
 <key>CFBundleDisplayName</key><string>00CaptureDate</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>0.1.0</string>
-<key>CFBundleVersion</key><string>1</string>
+<key>CFBundleShortVersionString</key><string>0.2.0</string>
+<key>CFBundleVersion</key><string>2</string>
 <key>LSMinimumSystemVersion</key><string>13.0</string>
 <key>NSHighResolutionCapable</key><true/>
 </dict></plist>

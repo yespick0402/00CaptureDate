@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import Combine
 
 struct ContentView: View {
     @ObservedObject var model: AppModel
@@ -15,6 +16,12 @@ struct ContentView: View {
         }
         .padding(20)
         .frame(minWidth: 960, minHeight: 690)
+        .sheet(isPresented: $model.showHistory) {
+            HistoryView(model: model)
+        }
+        .onReceive(Timer.publish(every: 3600, on: .main, in: .common).autoconnect()) { _ in
+            model.pruneHistoryIfIdle()
+        }
         .sheet(item: $editing) { item in
             ManualDateSheet(entry: item) { value in model.applyManualDate(for: item.id, text: value) }
         }
@@ -198,8 +205,10 @@ struct ContentView: View {
                     Button("작업 중단") { model.stopWork() }
                 }
                 Spacer()
+                Button("작업 기록 · 복원") { model.showHistory = true }
+                    .disabled(model.isBusy || model.historyStore == nil)
                 if model.latestLog != nil {
-                    Button("작업 기록 보기") { model.showLogInFinder() }
+                    Button("JSONL 로그 보기") { model.showLogInFinder() }
                 }
             }
             Text(model.status).font(.caption).foregroundStyle(.secondary).lineLimit(2)

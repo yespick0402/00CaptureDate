@@ -79,17 +79,20 @@ final class MetadataReader {
 
     init(toolURL: URL) { self.toolURL = toolURL }
 
+    // Single authoritative list: both one-shot and persistent transports use exactly
+    // the same metadata flags. Never simplify this list for performance.
+    static let exifArguments = ["-j", "-G1", "-a", "-s", "-api", "LargeFileSupport=1",
+                                "-api", "QuickTimeUTC=0", "-charset", "filename=UTF8",
+                                "-FileType", "-DateTimeOriginal", "-CreateDate", "-CreationDate",
+                                "-DateCreated", "-OffsetTimeOriginal", "-ContentCreateDate",
+                                "-MediaCreateDate", "-TrackCreateDate", "-TimeZone", "-DateTime"]
+
     func readBatch(_ inputs: [MediaInput]) -> [String: CaptureEvidence] {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/perl")
         p.currentDirectoryURL = toolURL.deletingLastPathComponent()
         // ExifTool runs read-only. Do not rely on Finder's creation or modification dates.
-        p.arguments = [toolURL.path, "-j", "-G1", "-a", "-s", "-api", "LargeFileSupport=1",
-                       "-api", "QuickTimeUTC=0", "-charset", "filename=UTF8",
-                       "-FileType", "-DateTimeOriginal", "-CreateDate", "-CreationDate",
-                       "-DateCreated", "-OffsetTimeOriginal", "-ContentCreateDate",
-                       "-MediaCreateDate", "-TrackCreateDate", "-TimeZone", "-DateTime"]
-                       + inputs.map { $0.url.path }
+        p.arguments = [toolURL.path] + Self.exifArguments + inputs.map { $0.url.path }
         let out = Pipe()
         p.standardOutput = out
         p.standardError = FileHandle.nullDevice

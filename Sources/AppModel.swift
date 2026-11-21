@@ -31,12 +31,53 @@ final class AppModel: ObservableObject {
     @Published var preflightMessage = ""
     @Published var errors: [String] = []
     @Published var alertMessage: String?
+    @Published var showHistory = false
+    @Published var isRestoring = false
+    @Published var historyRevision = 0
+    @Published var retentionDays: Int = 30
+    private(set) var historyStore: HistoryStore?
+
+    init() {
+        let configured = UserDefaults.standard.integer(forKey: "historyRetentionDays")
+        retentionDays = (1...30).contains(configured) ? configured : 30
+        do {
+            historyStore = try HistoryStore()
+            _ = try historyStore?.prune(days: retentionDays)
+        } catch {
+            historyStore = nil
+            alertMessage = "작업 이력 DB를 열지 못했습니다. 안전을 위해 작업 실행을 차단합니다: \(error.localizedDescription)"
+        }
+    }
+
+    func setRetentionDays(_ days: Int) {
+        guard (1...30).contains(days) else { return }
+        retentionDays = days
+        UserDefaults.standard.set(days, forKey: "historyRetentionDays")
+        guard let store = historyStore, !isBusy else { return }
+        Task.detached { [weak self] in
+            do {
+                _ = try store.prune(days: days)
+                await MainActor.run { self?.historyRevision += 1 }
+            } catch { await MainActor.run { self?.alertMessage = error.localizedDescription } }
+        }
+    }
+
+    func pruneHistoryIfIdle() {
+        guard !isBusy, let store = historyStore else { return }
+        let days = retentionDays
+        Task.detached { [weak self] in
+            do {
+                _ = try store.prune(days: days)
+                await MainActor.run { self?.historyRevision += 1 }
+            } catch { await MainActor.run { self?.alertMessage = error.localizedDescription } }
+        }
+    }
 
     private var scanTask: Task<Void, Never>?
     private var workControl: WorkControl?
     private let pageSize = 400
 
-    var isBusy: Bool { isScanning || isRunning }
+    var isBusy: Bool { isScanning || isRunning || isRestoring }
     var pageCount: Int { max(1, (entries.count + pageSize - 1) / pageSize) }
     var visibleEntries: [MediaEntry] { Array(entries.dropFirst(page * pageSize).prefix(pageSize)) }
     var totalSize: Int64 { totalSizeBytes }
@@ -120,10 +161,12 @@ final class AppModel: ObservableObject {
                 self?.status = "\(found.count)개 미디어 발견 · 촬영정보를 나누어 읽는 중"
             }
             let reader = MetadataReader(toolURL: tool)
+            let session = PersistentExifSession(reader: reader)
+            defer { session.close() }
             for offset in stride(from: 0, to: found.count, by: 48) {
                 if Task.isCancelled { break }
                 let chunk = Array(found[offset..<min(offset + 48, found.count)])
-                let data = reader.readBatch(chunk)
+                let data = session.readBatch(chunk)
                 let batch = chunk.enumerated().map { i, item in
                     MediaEntry(source: item, evidence: data[item.url.path] ?? .missing, ordinal: offset + i + 1)
                 }
@@ -209,11 +252,16 @@ final class AppModel: ObservableObject {
 
     func start() {
         guard !isBusy, !entries.isEmpty, validateDestination() else { return }
+        guard let store = historyStore else {
+            alertMessage = "작업 이력 DB를 사용할 수 없어 파일 변경을 시작하지 않습니다."
+            return
+        }
         let snapshot = entries
         let format = pattern
         let selectedMode = mode
         let folder = destination
         let preserve = preserveFolders
+        let daysToKeep = retentionDays
         isRunning = true
         paused = false
         processedCount = 0
@@ -254,6 +302,16 @@ final class AppModel: ObservableObject {
                 await MainActor.run { self?.isRunning = false; self?.alertMessage = "작업 기록을 만들지 못해 안전하게 중단했습니다: \(error.localizedDescription)" }
                 return
             }
+            let jobID: String
+            do { jobID = try store.beginJob(mode: selectedMode, logURL: audit.url) }
+            catch {
+                audit.close()
+                await MainActor.run {
+                    self?.isRunning = false
+                    self?.alertMessage = "SQLite 작업 기록을 만들지 못해 안전하게 중단했습니다: \(error.localizedDescription)"
+                }
+                return
+            }
             await MainActor.run { self?.latestLog = audit.url }
             for (index, plan) in result.plans.enumerated() {
                 if !control.waitIfPaused() { break }
@@ -261,27 +319,45 @@ final class AppModel: ObservableObject {
                     self?.currentFile = plan.entry.url.lastPathComponent
                     self?.status = "작업 \(index + 1) / \(result.plans.count): \(plan.entry.url.lastPathComponent)"
                 }
+                var historyItemID: String?
+                var fileOperationFinished = false
                 do {
+                    // A journal row must reach disk before any media is moved.
+                    historyItemID = try store.prepareItem(jobID: jobID, plan: plan, mode: selectedMode)
                     let hash = try FileOperator.process(plan: plan, mode: selectedMode, control: control)
-                    try audit.record(mode: selectedMode, source: plan.entry.url, output: plan.output,
-                                     outcome: "success", message: "완료", sha256: hash)
-                    await MainActor.run { self?.successCount += 1 }
-                } catch {
+                    fileOperationFinished = true
+                    try store.markSuccess(historyItemID!, plan: plan)
                     do {
                         try audit.record(mode: selectedMode, source: plan.entry.url, output: plan.output,
-                                         outcome: "failure", message: error.localizedDescription, sha256: nil)
+                                         outcome: "success", message: "완료", sha256: hash)
                     } catch {
-                        await MainActor.run { self?.errors.append("작업 기록 기록 실패: \(error.localizedDescription)") }
-                        control.stop()
+                        // SQLite is the authoritative journal; JSONL failure is nonfatal.
+                        await MainActor.run { self?.errors.append("보조 JSONL 기록 오류: \(error.localizedDescription)") }
                     }
+                    await MainActor.run { self?.successCount += 1 }
+                } catch {
+                    if let itemID = historyItemID, !fileOperationFinished {
+                        do { try store.markFailure(itemID, error.localizedDescription) }
+                        catch { control.stop() }
+                    }
+                    // If file operation succeeded but DB commit failed, stop immediately;
+                    // pending row is intentionally retained for manual reconciliation.
+                    if fileOperationFinished { control.stop() }
+                    try? audit.record(mode: selectedMode, source: plan.entry.url, output: plan.output,
+                                      outcome: "failure", message: error.localizedDescription, sha256: nil)
+                    let suffix = fileOperationFinished ? " · 파일 작업 후 DB 기록 실패: 자동 복원 금지, 수동 확인 필요" : ""
                     await MainActor.run {
                         self?.failedCount += 1
-                        self?.errors.append("\(plan.entry.url.lastPathComponent): \(error.localizedDescription)")
+                        self?.errors.append("\(plan.entry.url.lastPathComponent): \(error.localizedDescription)\(suffix)")
                     }
                 }
                 await MainActor.run { self?.processedCount += 1 }
             }
             audit.close()
+            do { try store.finishJob(jobID, interrupted: control.isStopped) }
+            catch { await MainActor.run { self?.errors.append("작업 종료 기록 실패: \(error.localizedDescription)") } }
+            do { _ = try store.prune(days: daysToKeep) }
+            catch { await MainActor.run { self?.errors.append("오래된 작업 기록 정리 실패: \(error.localizedDescription)") } }
             await MainActor.run {
                 self?.isRunning = false
                 self?.paused = false
@@ -306,6 +382,10 @@ final class AppModel: ObservableObject {
     }
     func showLogInFinder() {
         guard let url = latestLog else { return }
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            alertMessage = "보존 기간이 만료되었거나 작업 기록을 비워 해당 로그가 삭제되었습니다."
+            return
+        }
         NSWorkspace.shared.activateFileViewerSelecting([url])
     }
 }
