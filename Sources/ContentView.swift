@@ -85,7 +85,7 @@ struct ContentView: View {
                     .labelsHidden().pickerStyle(.segmented).frame(width: 300)
                     .disabled(model.isBusy)
                     Spacer()
-                    if model.mode == .copy {
+                    if model.mode == .copy && model.folderLayout == .existing {
                         Toggle("원래 폴더 구조 유지", isOn: $model.preserveFolders)
                             .disabled(model.isBusy)
                     }
@@ -97,6 +97,34 @@ struct ContentView: View {
                         Text(model.destination?.path ?? "대상 폴더를 선택하세요")
                             .font(.caption).foregroundStyle(.secondary).lineLimit(1)
                     }
+                }
+                HStack {
+                    Text("폴더 구성").frame(width: 90, alignment: .leading)
+                    Picker("", selection: $model.folderLayout) {
+                        ForEach(FolderLayout.allCases) { option in
+                            Text(option.rawValue).tag(option)
+                        }
+                    }
+                    .labelsHidden().pickerStyle(.segmented).frame(width: 310)
+                    .disabled(model.isBusy)
+                    Spacer()
+                }
+                if model.folderLayout == .captureDate {
+                    HStack {
+                        Text("폴더명 양식").frame(width: 90, alignment: .leading)
+                        TextField("예: {YYYY}년/{MM}월/{YYYY}.{MM}.{DD}_", text: $model.folderPattern)
+                            .textFieldStyle(.roundedBorder).disabled(model.isBusy)
+                            .font(.system(.body, design: .monospaced))
+                    }
+                    Text("/ 로 하위 폴더를 구분합니다. 날짜 토큰과 고정 글자를 사용하세요. 예: {YYYY}년/{MM}월/{YYYY}.{MM}.{DD}_")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Text(model.mode == .rename
+                         ? "원본 이름변경: 원본이 있던 폴더 아래에 날짜 폴더를 만든 뒤 파일을 이동합니다."
+                         : "새 위치에 복사: 선택한 복사 대상 폴더 아래에 날짜 폴더를 만든 뒤 복사합니다. 원본은 유지합니다.")
+                        .font(.caption).foregroundStyle(.secondary)
+                } else if model.mode == .rename {
+                    Text("원본 이름변경: 현재 파일이 있는 폴더에서 파일명만 변경합니다.")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
                 HStack {
                     Text("파일명 양식").frame(width: 90, alignment: .leading)
@@ -111,11 +139,13 @@ struct ContentView: View {
                         .foregroundStyle(.secondary).textSelection(.enabled)
                 }
                 if let sample = model.entries.first(where: { $0.evidence.stamp != nil }) {
-                    Text("예상 결과: \(model.predictedName(for: sample))")
+                    Text("예상 파일명: \(model.predictedName(for: sample))")
+                        .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                    Text("예상 저장 경로: \(model.predictedPath(for: sample))")
                         .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
                 }
             }.padding(5)
-        } label: { Label("2 · 이름변경 규칙 및 저장 방식", systemImage: "slider.horizontal.3") }
+        } label: { Label("2 · 작업 방식 / 폴더 구성 / 이름 양식", systemImage: "slider.horizontal.3") }
     }
 
     private var tablePanel: some View {

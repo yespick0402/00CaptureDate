@@ -14,6 +14,8 @@ final class AppModel: ObservableObject {
     @Published var mode: WorkMode = .rename
     @Published var destination: URL?
     @Published var preserveFolders = true
+    @Published var folderLayout: FolderLayout = .existing
+    @Published var folderPattern = FolderPattern.defaultValue
     @Published var pattern = NamePattern.defaultValue
     @Published var page = 0
     @Published var isScanning = false
@@ -222,8 +224,31 @@ final class AppModel: ObservableObject {
 
     func predictedName(for entry: MediaEntry) -> String {
         guard let stamp = entry.evidence.stamp else { return "촬영일시 없음" }
-        do { return try NamePattern.render(pattern, stamp: stamp, originalURL: entry.url, ordinal: entry.ordinal) }
+        do { return try Planner.desiredName(for: entry, pattern: pattern, mode: mode, folderLayout: folderLayout) }
         catch { return "규칙 오류: \(error.localizedDescription)" }
+    }
+
+    func predictedPath(for entry: MediaEntry) -> String {
+        guard let stamp = entry.evidence.stamp else { return "촬영일시 없음" }
+        do {
+            let name = try Planner.desiredName(for: entry, pattern: pattern, mode: mode, folderLayout: folderLayout)
+            let base: URL
+            if mode == .rename {
+                base = entry.url.deletingLastPathComponent()
+            } else {
+                guard let dest = destination else { return "복사할 위치를 선택하세요" }
+                base = folderLayout == .existing && preserveFolders && !entry.relativeFolder.isEmpty
+                    ? dest.appendingPathComponent(entry.relativeFolder, isDirectory: true) : dest
+            }
+            let parent: URL
+            if folderLayout == .captureDate {
+                let relative = try FolderPattern.render(folderPattern, stamp: stamp)
+                parent = base.appendingPathComponent(relative, isDirectory: true)
+            } else {
+                parent = base
+            }
+            return parent.appendingPathComponent(name).path
+        } catch { return "규칙 오류: \(error.localizedDescription)" }
     }
 
     private func validateDestination() -> Bool {
@@ -244,7 +269,8 @@ final class AppModel: ObservableObject {
     func dryRun() {
         guard !isBusy, !entries.isEmpty, validateDestination() else { return }
         let result = Planner.prepare(entries, pattern: pattern, mode: mode,
-                                     destination: destination, preserveFolders: preserveFolders)
+                                     destination: destination, preserveFolders: preserveFolders,
+                                     folderLayout: folderLayout, folderPattern: folderPattern)
         preflightMessage = "실행 가능 \(result.plans.count)개 · 중복/규칙 오류 \(result.issues.count)개 · 준비된 원본 용량 \(ByteCountFormatter.string(fromByteCount: result.totalBytes, countStyle: .file))"
         errors = Array(result.issues.prefix(100))
         status = "미리보기 검사 완료. 현재 디스크 상태 기준이며 실행 직전에도 다시 검사합니다."
@@ -261,6 +287,8 @@ final class AppModel: ObservableObject {
         let selectedMode = mode
         let folder = destination
         let preserve = preserveFolders
+        let layout = folderLayout
+        let folderTemplate = folderPattern
         let daysToKeep = retentionDays
         isRunning = true
         paused = false
@@ -275,7 +303,8 @@ final class AppModel: ObservableObject {
         status = "실행 전 파일명 충돌을 검사하고 있습니다."
         Task.detached(priority: .userInitiated) { [weak self] in
             let result = Planner.prepare(snapshot, pattern: format, mode: selectedMode,
-                                         destination: folder, preserveFolders: preserve)
+                                         destination: folder, preserveFolders: preserve,
+                                         folderLayout: layout, folderPattern: folderTemplate)
             await MainActor.run {
                 self?.plannedCount = result.plans.count
                 self?.preflightMessage = "처리 계획 \(result.plans.count)개 · 미처리 충돌/오류 \(result.issues.count)개"

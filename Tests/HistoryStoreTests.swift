@@ -75,8 +75,28 @@ struct HistoryStoreTests {
         verify(fm.fileExists(atPath: copyOriginal.path), "original survives copied-file restore")
         verify(fm.fileExists(atPath: destination.appendingPathComponent("B.ARW").path), "copy gets old basename")
 
+        // Capture-date rename uses the same SQLite journal to restore both original path and filename.
+        let treeOriginal = source.appendingPathComponent("Capture.ARW")
+        let treeSidecar = source.appendingPathComponent("Capture.XMP")
+        try Data("tree restore content".utf8).write(to: treeOriginal)
+        try Data("tree sidecar".utf8).write(to: treeSidecar)
+        let treeResult = Planner.prepare([try entry(treeOriginal)], pattern: NamePattern.defaultValue,
+                                         mode: .rename, destination: nil, preserveFolders: false,
+                                         folderLayout: .captureDate, folderPattern: FolderPattern.defaultValue)
+        verify(treeResult.plans.count == 1, "dated rename restore plan")
+        let treePlan = treeResult.plans[0]
+        let treeJob = try history.beginJob(mode: .rename, logURL: temp.appendingPathComponent("log4.jsonl"))
+        let treeItem = try history.prepareItem(jobID: treeJob, plan: treePlan, mode: .rename)
+        _ = try FileOperator.process(plan: treePlan, mode: .rename, control: WorkControl())
+        try history.markSuccess(treeItem, plan: treePlan)
+        try history.finishJob(treeJob, interrupted: false)
+        verify(fm.fileExists(atPath: treePlan.output.path), "dated rename moved")
+        try history.restoreItem(treeItem)
+        verify(fm.fileExists(atPath: treeOriginal.path) && fm.fileExists(atPath: treeSidecar.path), "dated rename restored path and sidecar")
+        verify(!fm.fileExists(atPath: treePlan.output.path), "dated renamed file removed after restore")
+
         // Expiration uses job finish time and never changes media.
-        verify(try history.prune(days: 30, now: Date().addingTimeInterval(31*86400)) == 3, "old sessions expired")
+        verify(try history.prune(days: 30, now: Date().addingTimeInterval(31*86400)) == 4, "old sessions expired")
         verify(try history.jobs().isEmpty, "pruned DB")
         verify(fm.fileExists(atPath: copyOriginal.path), "prune leaves media")
         let inProgress = try history.beginJob(mode: .rename, logURL: temp.appendingPathComponent("newlog.jsonl"))
@@ -84,6 +104,6 @@ struct HistoryStoreTests {
         try history.finishJob(inProgress, interrupted: true)
         verify(try history.clearAll() == 1, "manual clear")
         verify(try history.jobs().isEmpty, "empty confirmed")
-        print("PASS: SQLite history / reopen / paired undo / duplicate guard / inode guard / copy undo / retention / clear")
+        print("PASS: SQLite history / reopen / paired undo / date folder restore / inode guard / copy undo / retention / clear")
     }
 }

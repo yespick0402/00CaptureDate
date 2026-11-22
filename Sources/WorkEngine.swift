@@ -12,6 +12,9 @@ struct WorkPlan {
     let entry: MediaEntry
     let output: URL
     let companions: [(from: URL, to: URL)]
+    // Physical directory root supplied by the user (copy), or the source's parent (rename).
+    // FileOperator never creates or follows generated subfolders outside this root.
+    let directoryRoot: URL
 }
 
 struct PreflightResult {
@@ -21,8 +24,24 @@ struct PreflightResult {
 }
 
 enum Planner {
+    static func desiredName(for entry: MediaEntry, pattern: String, mode: WorkMode,
+                            folderLayout: FolderLayout) throws -> String {
+        guard let stamp = entry.evidence.stamp else { throw PlanError.unknownDate }
+        if mode == .rename && pattern == NamePattern.defaultValue {
+            let marker = stamp.compactDate + "_" + stamp.compactTime + "_"
+            if entry.url.deletingPathExtension().lastPathComponent.hasPrefix(marker) {
+                // A file named by an earlier version may still need date-folder organization.
+                if folderLayout == .captureDate { return entry.url.lastPathComponent }
+                throw PlanError.alreadyRenamed
+            }
+        }
+        return try NamePattern.render(pattern, stamp: stamp, originalURL: entry.url, ordinal: entry.ordinal)
+    }
+
     static func prepare(_ entries: [MediaEntry], pattern: String, mode: WorkMode,
-                        destination: URL?, preserveFolders: Bool) -> PreflightResult {
+                        destination: URL?, preserveFolders: Bool,
+                        folderLayout: FolderLayout = .existing,
+                        folderPattern: String = FolderPattern.defaultValue) -> PreflightResult {
         let fm = FileManager.default
         var plans: [WorkPlan] = []
         var issues: [String] = []
@@ -33,20 +52,27 @@ enum Planner {
         for entry in entries {
             guard entry.eligible, let stamp = entry.evidence.stamp else { continue }
             do {
-                if mode == .rename && pattern == NamePattern.defaultValue {
-                    let marker = stamp.compactDate + "_" + stamp.compactTime + "_"
-                    if entry.url.deletingPathExtension().lastPathComponent.hasPrefix(marker) {
-                        throw PlanError.alreadyRenamed
-                    }
-                }
-                let newName = try NamePattern.render(pattern, stamp: stamp, originalURL: entry.url, ordinal: entry.ordinal)
-                let parent: URL
+                let newName = try desiredName(for: entry, pattern: pattern, mode: mode, folderLayout: folderLayout)
+                let base: URL
                 switch mode {
-                case .rename: parent = entry.url.deletingLastPathComponent()
+                case .rename:
+                    // Rename + date layout moves WITHIN the original parent folder's volume.
+                    // Never redirect original data to an unrelated destination.
+                    base = entry.url.deletingLastPathComponent()
                 case .copy:
                     guard let d = destination else { throw PlanError.noDestination }
-                    parent = preserveFolders && !entry.relativeFolder.isEmpty
+                    base = folderLayout == .existing && preserveFolders && !entry.relativeFolder.isEmpty
                         ? d.appendingPathComponent(entry.relativeFolder, isDirectory: true) : d
+                }
+                let parent: URL
+                if folderLayout == .captureDate {
+                    let relative = try FolderPattern.render(folderPattern, stamp: stamp)
+                    if mode == .rename && base.standardizedFileURL.path.hasSuffix("/" + relative) {
+                        throw PlanError.alreadyOrganized
+                    }
+                    parent = base.appendingPathComponent(relative, isDirectory: true)
+                } else {
+                    parent = base
                 }
                 let dest = parent.appendingPathComponent(newName)
                 if key(dest.path) == key(entry.url.path) { throw PlanError.sameName }
@@ -62,7 +88,8 @@ enum Planner {
                     if reserved.contains(k) { throw PlanError.duplicate(target.lastPathComponent) }
                 }
                 allTargets.forEach { reserved.insert(key($0.path)) }
-                plans.append(WorkPlan(entry: entry, output: dest, companions: companions))
+                plans.append(WorkPlan(entry: entry, output: dest, companions: companions,
+                                      directoryRoot: mode == .rename ? entry.url.deletingLastPathComponent() : (destination ?? base)))
                 bytes += entry.size
             } catch {
                 issues.append("\(entry.url.lastPathComponent): \(error.localizedDescription)")
@@ -72,12 +99,14 @@ enum Planner {
     }
 
     enum PlanError: Error, LocalizedError {
-        case noDestination, sameName, alreadyRenamed, exists(String), duplicate(String)
+        case noDestination, sameName, alreadyRenamed, alreadyOrganized, unknownDate, exists(String), duplicate(String)
         var errorDescription: String? {
             switch self {
             case .noDestination: return "대상 폴더를 선택하지 않았습니다"
             case .sameName: return "원본과 결과 파일명이 같아 건너뜁니다"
             case .alreadyRenamed: return "기본 이름 양식이 이미 적용된 파일을 재처리하지 않습니다"
+            case .alreadyOrganized: return "이미 같은 촬영일자 폴더에 있어 중복 하위 폴더를 만들지 않습니다"
+            case .unknownDate: return "촬영일시가 없습니다"
             case .exists(let s): return "대상 파일이 이미 존재합니다: \(s)"
             case .duplicate(let s): return "이번 작업 안에서 파일명이 중복됩니다: \(s)"
             }
@@ -139,6 +168,43 @@ final class AuditLogger {
 }
 
 enum FileOperator {
+    // Validate every generated path component before creating it. In particular, reject
+    // a pre-existing symlink named '2026년' that could redirect an original move away
+    // from its starting volume. Never remove a non-empty user directory on failure.
+    private static func ensureSafeParent(_ plan: WorkPlan) throws {
+        let fm = FileManager.default
+        let root = plan.directoryRoot.standardizedFileURL
+        let target = plan.output.deletingLastPathComponent().standardizedFileURL
+        let prefix = root.path == "/" ? "/" : root.path + "/"
+        guard target.path == root.path || target.path.hasPrefix(prefix) else {
+            throw WorkError.unsafeDirectory("선택한 저장 기준 위치 밖으로 이동할 수 없습니다: \(target.path)")
+        }
+        // Preserve v0.2 behavior for ordinary same-folder rename/copy: no new
+        // folder hierarchy is being created in that case.
+        if target.path == root.path { return }
+        let rootInfo = try root.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+        guard rootInfo.isDirectory == true, rootInfo.isSymbolicLink != true else {
+            throw WorkError.unsafeDirectory("저장 기준 폴더가 없거나 심볼릭 링크입니다: \(root.path)")
+        }
+        let relative = String(target.path.dropFirst(prefix.count))
+        var current = root
+        for part in relative.split(separator: "/") {
+            current.appendPathComponent(String(part), isDirectory: true)
+            if fm.fileExists(atPath: current.path) {
+                let info = try current.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+                guard info.isDirectory == true, info.isSymbolicLink != true else {
+                    throw WorkError.unsafeDirectory("하위 폴더가 일반 디렉터리가 아닙니다: \(current.path)")
+                }
+            } else {
+                // Broken symlinks may return false for fileExists. Refuse them as well.
+                if (try? current.resourceValues(forKeys: [.isSymbolicLinkKey]))?.isSymbolicLink == true {
+                    throw WorkError.unsafeDirectory("하위 폴더에 심볼릭 링크가 있습니다: \(current.path)")
+                }
+                try fm.createDirectory(at: current, withIntermediateDirectories: false)
+            }
+        }
+    }
+
     static func process(plan: WorkPlan, mode: WorkMode, control: WorkControl) throws -> String? {
         guard control.waitIfPaused() else { throw WorkError.cancelled }
         let fm = FileManager.default
@@ -153,11 +219,13 @@ enum FileOperator {
         for target in [plan.output] + plan.companions.map(\.to) {
             if fm.fileExists(atPath: target.path) { throw WorkError.targetExists(target.path) }
         }
+        try ensureSafeParent(plan)
         switch mode {
         case .rename:
             var moved: [(from: URL, to: URL)] = []
             do {
                 for pair in plan.companions + [(from: source, to: plan.output)] {
+                    if fm.fileExists(atPath: pair.to.path) { throw WorkError.targetExists(pair.to.path) }
                     try fm.moveItem(at: pair.from, to: pair.to)
                     moved.append(pair)
                 }
@@ -182,7 +250,6 @@ enum FileOperator {
             do {
                 for pair in pairs {
                     if control.isStopped { throw WorkError.cancelled }
-                    try fm.createDirectory(at: pair.to.deletingLastPathComponent(), withIntermediateDirectories: true)
                     let temp = pair.to.deletingLastPathComponent().appendingPathComponent(".00CaptureDate-\(UUID().uuidString).partial")
                     // Reserve cleanup target before the copy, including partial-copy errors.
                     staged.append((temporary: temp, final: pair.to))
@@ -234,7 +301,7 @@ enum FileOperator {
     }
 
     enum WorkError: Error, LocalizedError {
-        case cancelled, sourceChanged, targetExists(String), hashMismatch(String), rollbackFailed(String), cleanupFailed(String)
+        case cancelled, sourceChanged, targetExists(String), hashMismatch(String), rollbackFailed(String), cleanupFailed(String), unsafeDirectory(String)
         var errorDescription: String? {
             switch self {
             case .cancelled: return "사용자가 작업을 중단했습니다"
@@ -243,6 +310,7 @@ enum FileOperator {
             case .hashMismatch(let p): return "SHA-256 검증 불일치: \(p)"
             case .rollbackFailed(let p): return "이름변경 롤백 실패 · 수동 확인 필요: \(p)"
             case .cleanupFailed(let p): return "복사 실패 후 임시/결과 파일 정리 실패 · 수동 확인 필요: \(p)"
+            case .unsafeDirectory(let p): return "안전하지 않은 폴더 경로: \(p)"
             }
         }
     }
